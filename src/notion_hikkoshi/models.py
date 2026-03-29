@@ -15,6 +15,18 @@ class ColumnDef:
 
 
 @dataclass
+class Attachment:
+    """ページに添付されたファイル"""
+
+    file_path: Path
+    file_name: str
+    mime_type: str  # "image/png", "application/pdf", etc.
+    category: str  # "image", "pdf", "other"
+    referenced_from: str = ""  # Markdown内の参照パス
+    exists: bool = True
+
+
+@dataclass
 class ExportedDatabase:
     """エクスポートされたデータベース"""
 
@@ -33,6 +45,7 @@ class ExportedPage:
     markdown_path: Path
     children: list[ExportedPage | ExportedDatabase] = field(default_factory=list)
     images: list[Path] = field(default_factory=list)
+    attachments: list[Attachment] = field(default_factory=list)
     notion_id: str | None = None
 
 

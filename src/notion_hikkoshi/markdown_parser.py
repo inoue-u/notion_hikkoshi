@@ -396,21 +396,31 @@ class NotionBlockRenderer:
         if not src:
             return
 
-        # ローカルファイルパスの場合はスキップ（警告のみ）
-        if not src.startswith(("http://", "https://")):
+        # 外部URL → image block
+        if src.startswith(("http://", "https://")):
             self.blocks.append({
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": _make_rich_text(f"[画像: {alt or src}]", italic=True),
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": {"url": src},
                 },
             })
             return
 
+        # ローカルファイル → プレースホルダ (添付ファイルとして別途処理)
+        import urllib.parse
+        decoded = urllib.parse.unquote(src)
+        display = alt or decoded
         self.blocks.append({
-            "type": "image",
-            "image": {
-                "type": "external",
-                "external": {"url": src},
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": f"[画像: {display}]"},
+                        "annotations": {"italic": True, "color": "gray"},
+                    },
+                ],
             },
         })
 
