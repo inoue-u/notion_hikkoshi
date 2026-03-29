@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notion-hikkoshi"
+version = "0.1.0"
+description = "Notionアカウント移行ツール - エクスポートデータを新アカウントにインポート"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "notion-client>=2.0.0",
+    "click>=8.0",
+    "python-dotenv>=1.0",
+    "mistune>=3.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+notion-hikkoshi = "notion_hikkoshi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
