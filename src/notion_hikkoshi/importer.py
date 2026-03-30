@@ -1,4 +1,15 @@
-"""インポートオーケストレーター"""
+"""2-pass インポートオーケストレーター
+
+Pass 1: 構造作成
+  - 全ページ・DBの空作成 (親→子の順)
+  - notion_id の確定
+
+Pass 2: コンテンツ流し込み
+  - 本文変換・書き込み
+  - 添付ファイル処理
+  - 内部リンク解決
+  - DB行投入
+"""
 
 from __future__ import annotations
 
@@ -8,11 +19,14 @@ from typing import Any
 
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from .attachment_resolver import attachments_to_blocks, resolve_attachments
-from .csv_parser import infer_schema, read_csv_rows
+from .asset_resolver import make_asset_block, resolve_assets_for_node
+from .csv_parser import infer_schema
+from .link_resolver import resolve_links_for_node, rewrite_links_in_text
 from .markdown_parser import markdown_to_blocks
-from .models import ExportedDatabase, ExportedPage, ExportTree
+from .node_registry import AssetRef, Node, NodeRegistry, NodeType
 from .notion_api import NotionImporter
+from .notion_database_writer import create_empty_database, insert_database_rows
+from .notion_page_writer import create_empty_page, write_page_content
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +39,16 @@ class ImportResult:
     databases_created: int = 0
     rows_created: int = 0
     rows_failed: int = 0
-    attachments_found: int = 0
+    blocks_written: int = 0
+    blocks_failed: int = 0
+    attachments_detected: int = 0
+    attachments_saved: int = 0
+    attachments_failed: int = 0
     attachments_missing: int = 0
+    links_resolved: int = 0
+    links_unresolved: int = 0
+    degraded_blocks: int = 0
+    csv_duplicates_skipped: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -35,15 +57,19 @@ class ImportResult:
 
 
 def import_tree(
-    tree: ExportTree,
-    api: NotionImporter,
+    registry: NodeRegistry,
+    api: NotionImporter | None,
     parent_page_id: str,
     dry_run: bool = False,
     include_assets: bool = True,
 ) -> ImportResult:
-    """エクスポートツリーをNotionにインポートする。"""
+    """2-pass インポートを実行する。"""
     result = ImportResult()
-    total = tree.page_count + tree.database_count
+    nodes = registry.all_nodes
+    total = len(nodes)
+
+    # DB スキーマキャッシュ (source_path → schema)
+    db_schemas: dict[str, Any] = {}
 
     with Progress(
         SpinnerColumn(),
@@ -51,175 +77,306 @@ def import_tree(
         TextColumn("[bold blue]{task.completed}/{task.total}"),
         transient=True,
     ) as progress:
-        task = progress.add_task("インポート中...", total=total)
 
-        for item in tree.root_children:
-            _import_item(
-                item, api, parent_page_id, dry_run, include_assets,
-                result, progress, task,
-            )
+        # === Pass 1: 構造作成 ===
+        task1 = progress.add_task("Pass 1: 構造作成...", total=total)
+
+        # BFS順 (親→子) で作成
+        ordered = _bfs_order(registry)
+
+        for node in ordered:
+            progress.update(task1, description=f"Pass1: {node.title[:40]}")
+
+            if node.node_type == NodeType.DATABASE:
+                # 重複CSV はスキップ
+                if node.csv_duplicate_of:
+                    logger.info(
+                        "CSV重複スキップ: %s (元: %s)",
+                        node.source_path, node.csv_duplicate_of,
+                    )
+                    result.csv_duplicates_skipped += 1
+                    progress.advance(task1)
+                    continue
+
+                schema = infer_schema(node.file_path)
+                db_schemas[node.source_path] = schema
+
+                if dry_run:
+                    _dry_run_database(node, schema, result)
+                    node.notion_id = "dry-run-db-id"
+                else:
+                    parent_nid = _get_parent_notion_id(node, parent_page_id)
+                    node.notion_id = create_empty_database(
+                        api, parent_nid, node.title, schema,
+                    )
+                result.databases_created += 1
+
+            elif node.node_type == NodeType.PAGE:
+                if dry_run:
+                    node.notion_id = "dry-run-page-id"
+                    logger.info(
+                        "[DRY RUN] ページ作成: %s (parent=%s, depth=%d)",
+                        node.source_path,
+                        node.parent_source_path or "ROOT",
+                        node.depth,
+                    )
+                else:
+                    parent_nid = _get_parent_notion_id(node, parent_page_id)
+                    node.notion_id = create_empty_page(api, parent_nid, node.title)
+                result.pages_created += 1
+
+            progress.advance(task1)
+
+        # === Pass 2: コンテンツ流し込み ===
+        task2 = progress.add_task("Pass 2: コンテンツ...", total=total)
+
+        for node in ordered:
+            progress.update(task2, description=f"Pass2: {node.title[:40]}")
+
+            if node.csv_duplicate_of:
+                progress.advance(task2)
+                continue
+
+            if node.node_type == NodeType.PAGE:
+                _pass2_page(
+                    node, registry, api, dry_run, include_assets, result,
+                )
+            elif node.node_type == NodeType.DATABASE:
+                schema = db_schemas.get(node.source_path)
+                if schema:
+                    _pass2_database(node, schema, api, dry_run, result)
+
+            progress.advance(task2)
 
     return result
 
 
-def _import_item(
-    item: ExportedPage | ExportedDatabase,
-    api: NotionImporter,
-    parent_id: str,
+def _bfs_order(registry: NodeRegistry) -> list[Node]:
+    """BFS順 (親→子) でノードリストを返す"""
+    ordered: list[Node] = []
+    queue = list(registry.root_nodes)
+    # 安定ソート (source_path順)
+    queue.sort(key=lambda n: n.source_path)
+
+    while queue:
+        node = queue.pop(0)
+        ordered.append(node)
+        children = sorted(node.children, key=lambda n: n.source_path)
+        queue.extend(children)
+
+    return ordered
+
+
+def _get_parent_notion_id(node: Node, root_parent_id: str) -> str:
+    """ノードの親の notion_id を取得する"""
+    if node.parent and node.parent.notion_id:
+        return node.parent.notion_id
+    return root_parent_id
+
+
+def _pass2_page(
+    node: Node,
+    registry: NodeRegistry,
+    api: NotionImporter | None,
     dry_run: bool,
     include_assets: bool,
     result: ImportResult,
-    progress: Progress,
-    task: Any,
 ) -> None:
-    if isinstance(item, ExportedPage):
-        _import_page(item, api, parent_id, dry_run, include_assets, result, progress, task)
-    elif isinstance(item, ExportedDatabase):
-        _import_database(item, api, parent_id, dry_run, result, progress, task)
-
-
-def _import_page(
-    page: ExportedPage,
-    api: NotionImporter,
-    parent_id: str,
-    dry_run: bool,
-    include_assets: bool,
-    result: ImportResult,
-    progress: Progress,
-    task: Any,
-) -> None:
+    """Pass 2: ページのコンテンツ流し込み"""
     try:
-        progress.update(task, description=f"ページ: {page.title[:40]}")
+        md_text = node.file_path.read_text(encoding="utf-8")
 
-        md_text = page.markdown_path.read_text(encoding="utf-8")
-        blocks = markdown_to_blocks(md_text)
+        # 1. 内部リンク解決
+        links = resolve_links_for_node(node, md_text, registry)
+        node.internal_links = links
 
-        # 添付ファイルブロックを追加
-        if include_assets and page.attachments:
-            existing = [a for a in page.attachments if a.exists]
-            missing = [a for a in page.attachments if not a.exists]
-            result.attachments_found += len(existing)
-            result.attachments_missing += len(missing)
+        for lnk in links:
+            if lnk.resolved_node and lnk.resolved_node.notion_id:
+                nid = lnk.resolved_node.notion_id
+                if not dry_run and nid != "dry-run-page-id":
+                    lnk.notion_url = f"https://www.notion.so/{nid.replace('-', '')}"
+                result.links_resolved += 1
+            else:
+                result.links_unresolved += 1
 
-            att_blocks = attachments_to_blocks(page.attachments)
-            blocks.extend(att_blocks)
+        # リンク書き換え
+        md_text = rewrite_links_in_text(md_text, links)
 
-            for a in existing:
-                logger.info(
-                    "添付ファイル処理: %s (カテゴリ=%s, パス=%s)",
-                    a.file_name, a.category, a.file_path,
-                )
-            for a in missing:
-                logger.warning(
-                    "添付ファイル未検出: %s (参照=%s, 解決パス=%s)",
-                    a.file_name, a.referenced_from, a.file_path,
-                )
-
-        if dry_run:
-            att_count = len(page.attachments) if page.attachments else 0
-            img_count = sum(1 for a in page.attachments if a.category == "image")
-            pdf_count = sum(1 for a in page.attachments if a.category == "pdf")
-            missing_count = sum(1 for a in page.attachments if not a.exists)
-            logger.info(
-                "[DRY RUN] ページ作成: %s (%dブロック, 添付=%d [画像=%d, PDF=%d], 未検出=%d)",
-                page.title, len(blocks), att_count, img_count, pdf_count, missing_count,
-            )
-            page_id = "dry-run-id"
-        else:
-            page_id = api.create_page(parent_id, page.title, blocks)
-
-        page.notion_id = page_id
-        result.pages_created += 1
-        progress.advance(task)
-
-        for child in page.children:
-            _import_item(
-                child, api,
-                page_id if not dry_run else parent_id,
-                dry_run, include_assets, result, progress, task,
-            )
-
-    except Exception as e:
-        error_msg = f"ページ '{page.title}' のインポートに失敗: {e}"
-        logger.error(error_msg)
-        result.errors.append(error_msg)
-        progress.advance(task)
-
-
-def _import_database(
-    db: ExportedDatabase,
-    api: NotionImporter,
-    parent_id: str,
-    dry_run: bool,
-    result: ImportResult,
-    progress: Progress,
-    task: Any,
-) -> None:
-    try:
-        progress.update(task, description=f"DB: {db.title[:40]}")
-        logger.info("データベース処理開始: %s (CSV: %s)", db.title, db.csv_path.name)
-
-        # スキーマを推定 (DatabaseSchemaオブジェクトで一元管理)
-        schema = infer_schema(db.csv_path)
-        notion_schema = schema.to_notion_schema()
-
-        logger.info(
-            "DBスキーマ確定: title列=%r, 全列=%r",
-            schema.title_column,
-            schema.normalized_names,
-        )
-
-        if dry_run:
-            logger.info(
-                "[DRY RUN] データベース作成: %s (%d列, %d行, title列=%r)",
-                db.title, len(schema.columns), db.row_count, schema.title_column,
-            )
-            for col in schema.columns:
-                logger.info(
-                    "[DRY RUN]   列: %r → 型=%s%s",
-                    col.name, col.inferred_type,
-                    " (title)" if col.inferred_type == "title" else "",
-                )
-            db_id = "dry-run-db-id"
-        else:
-            db_id = api.create_database(parent_id, db.title, notion_schema)
-
-        db.notion_id = db_id
-        result.databases_created += 1
-
-        # 行を追加 (DatabaseSchemaの統一メソッドでプロパティ生成)
-        rows = read_csv_rows(db.csv_path)
-        for row_idx, row in enumerate(rows):
-            try:
-                properties = schema.row_to_properties(row)
-                if dry_run:
-                    title_val = ""
-                    if schema.title_column and schema.title_column in properties:
-                        title_prop = properties[schema.title_column]
-                        if "title" in title_prop and title_prop["title"]:
-                            title_val = title_prop["title"][0]["text"]["content"]
-                    logger.debug(
-                        "[DRY RUN] 行追加 #%d: title=%r, 列数=%d",
-                        row_idx + 1, title_val, len(properties),
-                    )
+        # 2. 添付ファイル解決
+        if include_assets:
+            assets = resolve_assets_for_node(node, md_text)
+            node.attachments = assets
+            for a in assets:
+                result.attachments_detected += 1
+                if a.exists:
+                    result.attachments_saved += 1
                 else:
-                    api.create_database_row(db_id, properties)
-                result.rows_created += 1
-            except Exception as e:
-                result.rows_failed += 1
-                prop_names = list(properties.keys()) if 'properties' in dir() else []
-                error_msg = (
-                    f"DB '{db.title}' 行#{row_idx + 1} 追加失敗: {e}\n"
-                    f"  送信プロパティ名: {prop_names}\n"
-                    f"  DB列名: {schema.normalized_names}"
-                )
-                logger.warning(error_msg)
-                result.errors.append(error_msg)
+                    result.attachments_missing += 1
 
-        progress.advance(task)
+        # 3. Markdown → ブロック変換
+        blocks, warnings = markdown_to_blocks(md_text)
+        node.warnings.extend(warnings)
+        result.degraded_blocks += len(warnings)
+
+        # 4. __local_asset__ マーカーを実際のブロックに差し替え
+        if include_assets:
+            blocks = _replace_asset_markers(blocks, node)
+
+        # 5. 書き込み
+        if dry_run:
+            att_count = len(node.attachments)
+            link_count = len(links)
+            logger.info(
+                "[DRY RUN] コンテンツ書込: %s (%dブロック, %d添付, "
+                "%dリンク[解決=%d,未解決=%d], %d警告)",
+                node.source_path,
+                len(blocks),
+                att_count,
+                link_count,
+                sum(1 for l in links if l.resolved_node),
+                sum(1 for l in links if l.fallback),
+                len(warnings),
+            )
+            result.blocks_written += len(blocks)
+        else:
+            success, failed, write_warnings = write_page_content(
+                api, node.notion_id, blocks, node.title,
+            )
+            result.blocks_written += success
+            result.blocks_failed += failed
+            node.warnings.extend(write_warnings)
+
+        _log_page_summary(node, blocks, links, result)
 
     except Exception as e:
-        error_msg = f"データベース '{db.title}' のインポートに失敗: {e}"
+        error_msg = f"ページコンテンツ書込失敗: {node.source_path}: {e}"
         logger.error(error_msg)
         result.errors.append(error_msg)
-        progress.advance(task)
+
+
+def _replace_asset_markers(
+    blocks: list[dict[str, Any]],
+    node: Node,
+) -> list[dict[str, Any]]:
+    """__local_asset__ マーカーを添付ファイルブロックに差し替える"""
+    result_blocks: list[dict[str, Any]] = []
+    asset_map = {a.referenced_from: a for a in node.attachments}
+
+    for block in blocks:
+        if block.get("type") == "__local_asset__":
+            info = block["__local_asset__"]
+            src = info["src"]
+            asset = asset_map.get(src)
+            if asset:
+                result_blocks.append(make_asset_block(asset))
+            else:
+                # アセット未登録 → フォールバック
+                decoded = info.get("decoded", src)
+                alt = info.get("alt", "")
+                display = alt or decoded
+                result_blocks.append({
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{
+                            "type": "text",
+                            "text": {"content": f"[{display}]"},
+                            "annotations": {"italic": True, "color": "gray"},
+                        }],
+                    },
+                })
+        else:
+            result_blocks.append(block)
+
+    return result_blocks
+
+
+def _pass2_database(
+    node: Node,
+    schema: Any,
+    api: NotionImporter | None,
+    dry_run: bool,
+    result: ImportResult,
+) -> None:
+    """Pass 2: データベースの行投入"""
+    try:
+        from .csv_parser import read_csv_rows
+
+        rows = read_csv_rows(node.file_path)
+
+        if dry_run:
+            logger.info(
+                "[DRY RUN] DB行投入: %s (%d行, title列=%r, 列=%r)",
+                node.source_path,
+                len(rows),
+                schema.title_column,
+                schema.normalized_names,
+            )
+            result.rows_created += len(rows)
+            return
+
+        success, failed, warnings = insert_database_rows(api, node, schema)
+        result.rows_created += success
+        result.rows_failed += failed
+        result.errors.extend(warnings)
+
+    except Exception as e:
+        error_msg = f"DB行投入失敗: {node.source_path}: {e}"
+        logger.error(error_msg)
+        result.errors.append(error_msg)
+
+
+def _log_page_summary(
+    node: Node,
+    blocks: list[dict[str, Any]],
+    links: list,
+    result: ImportResult,
+) -> None:
+    """ページごとのサマリーログを出力する"""
+    logger.info(
+        "ページ処理完了: source=%s, parent=%s, notion_id=%s, "
+        "title=%r, children=%d, attachments=%d, links=%d, "
+        "blocks=%d, warnings=%d",
+        node.source_path,
+        node.parent_source_path or "ROOT",
+        node.notion_id,
+        node.title,
+        len(node.children),
+        len(node.attachments),
+        len(links),
+        len(blocks),
+        len(node.warnings),
+    )
+
+
+def _dry_run_database(
+    node: Node,
+    schema: Any,
+    result: ImportResult,
+) -> None:
+    """dry-run でのDB情報表示"""
+
+    def _count_csv_rows_local(path):
+        import csv
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                return sum(1 for _ in reader)
+        except Exception:
+            return 0
+
+    row_count = _count_csv_rows_local(node.file_path)
+    logger.info(
+        "[DRY RUN] データベース作成: %s (parent=%s, %d列, %d行, title列=%r)",
+        node.source_path,
+        node.parent_source_path or "ROOT",
+        len(schema.columns),
+        row_count,
+        schema.title_column,
+    )
+    for col in schema.columns:
+        logger.info(
+            "[DRY RUN]   列: %r → 型=%s%s",
+            col.name, col.inferred_type,
+            " (title)" if col.inferred_type == "title" else "",
+        )

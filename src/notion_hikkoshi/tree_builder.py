@@ -1,24 +1,33 @@
-"""エクスポートのフォルダ構造からページ階層を再構築する"""
+"""エクスポートのフォルダ構造から厳密な階層ツリーを再構築する。
+
+source_path を唯一の識別子として使い、親子関係を正確に保つ。
+_all.csv の重複検出も行う。
+"""
 
 from __future__ import annotations
 
+import csv
 import logging
+import re
 from pathlib import Path
 
-from .attachment_resolver import resolve_attachments
-from .csv_parser import infer_schema
-from .models import ExportedDatabase, ExportedPage, ExportTree
-from .utils import strip_notion_uuid
+from .node_registry import (
+    Node,
+    NodeRegistry,
+    NodeType,
+    normalize_path,
+    strip_notion_uuid,
+)
 
 logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
-ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".pptx", ".zip", ".txt"}
+ASSET_EXTENSIONS = IMAGE_EXTENSIONS | {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".pptx", ".zip", ".txt",
+}
 
 
 def _count_csv_rows(csv_path: Path) -> int:
-    """CSVファイルの行数をカウントする（ヘッダー除く）"""
-    import csv
     try:
         with open(csv_path, encoding="utf-8-sig") as f:
             reader = csv.reader(f)
@@ -28,92 +37,128 @@ def _count_csv_rows(csv_path: Path) -> int:
         return 0
 
 
-def _get_csv_schema(csv_path: Path):
-    """CSVファイルからスキーマを取得する"""
-    try:
-        return infer_schema(csv_path)
-    except Exception as e:
-        logger.warning("CSVスキーマ推定失敗: %s: %s", csv_path.name, e)
-        return None
+def _is_all_csv_duplicate(csv_name: str, sibling_csvs: set[str]) -> str | None:
+    """_all.csv が対応する通常CSVの重複かどうかを判定する。
 
-
-def _find_child_folder(parent_dir: Path, md_file: Path) -> Path | None:
-    """Markdownファイルに対応する子フォルダを探す。"""
-    folder_name = md_file.stem
-    child_dir = parent_dir / folder_name
-    if child_dir.is_dir():
-        return child_dir
+    例: "Tasks_all.csv" は "Tasks.csv" の重複。
+    返値: 重複元のファイル名 or None
+    """
+    m = re.match(r"^(.+)_all\.csv$", csv_name, re.IGNORECASE)
+    if m:
+        base = m.group(1) + ".csv"
+        if base in sibling_csvs:
+            return base
     return None
 
 
-def _build_items(
-    directory: Path,
-) -> list[ExportedPage | ExportedDatabase]:
-    """ディレクトリ内のアイテムを再帰的に構築する"""
-    items: list[ExportedPage | ExportedDatabase] = []
+def build_tree(root_dir: Path) -> NodeRegistry:
+    """エクスポートディレクトリから NodeRegistry を構築する。
 
+    ディレクトリ階層を正として、親子関係を厳密に再構築する。
+
+    Notion エクスポートの構造:
+      root/
+        PageA <uuid>.md
+        PageA <uuid>/           ← PageA の子要素を含むフォルダ
+          SubpageB <uuid>.md
+          Database <uuid>.csv
+          image.png
+    """
+    root_dir = root_dir.resolve()
+    registry = NodeRegistry(root_dir)
+    logger.info("ツリー構築開始: %s", root_dir)
+
+    _build_recursive(root_dir, root_dir, None, registry)
+
+    summary = registry.summary()
+    logger.info(
+        "ツリー構築完了: %dページ, %dデータベース (うち重複CSV=%d)",
+        summary["pages"],
+        summary["databases"],
+        summary["csv_duplicates"],
+    )
+    return registry
+
+
+def _build_recursive(
+    directory: Path,
+    root_dir: Path,
+    parent_node: Node | None,
+    registry: NodeRegistry,
+) -> None:
+    """ディレクトリを再帰的に走査してノードを構築する"""
     if not directory.is_dir():
-        return items
+        return
 
     md_files = sorted(directory.glob("*.md"))
     csv_files = sorted(directory.glob("*.csv"))
 
-    # CSVファイル → データベース
+    # CSV重複検出用のセット
+    csv_names = {f.name for f in csv_files}
+
+    # CSVファイル → データベースノード
     for csv_file in csv_files:
+        rel_path = normalize_path(str(csv_file.relative_to(root_dir)))
         title = strip_notion_uuid(csv_file.name)
-        schema = _get_csv_schema(csv_file)
-        columns = schema.columns if schema else []
-        row_count = _count_csv_rows(csv_file)
-        db = ExportedDatabase(
+
+        # _all.csv 重複チェック
+        dup_of = _is_all_csv_duplicate(csv_file.name, csv_names)
+        if dup_of:
+            logger.info(
+                "CSV重複検出 (スキップ): %s は %s の _all.csv 版",
+                csv_file.name, dup_of,
+            )
+
+        node = Node(
+            source_path=rel_path,
             title=title,
-            csv_path=csv_file,
-            columns=columns,
-            row_count=row_count,
+            node_type=NodeType.DATABASE,
+            file_path=csv_file,
+            parent=parent_node,
+            csv_duplicate_of=normalize_path(
+                str((csv_file.parent / dup_of).relative_to(root_dir))
+            ) if dup_of else None,
         )
-        items.append(db)
-        logger.debug("データベース検出: %s (%d行)", title, row_count)
 
-    # Markdownファイル → ページ
-    for md_file in md_files:
-        title = strip_notion_uuid(md_file.name)
-        page = ExportedPage(title=title, markdown_path=md_file)
+        if parent_node:
+            parent_node.children.append(node)
+        registry.register(node)
 
-        # Markdown本文から添付ファイルを解決
-        try:
-            md_text = md_file.read_text(encoding="utf-8")
-            page.attachments = resolve_attachments(md_text, md_file)
-        except Exception as e:
-            logger.warning("添付ファイル解決失敗: %s: %s", md_file.name, e)
-
-        # 対応する子フォルダ
-        child_dir = _find_child_folder(directory, md_file)
-        if child_dir:
-            # 画像ファイルを収集
-            for f in child_dir.iterdir():
-                if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS:
-                    page.images.append(f)
-
-            page.children = _build_items(child_dir)
-
-        items.append(page)
-        att_count = len(page.attachments)
-        img_count = sum(1 for a in page.attachments if a.category == "image")
-        pdf_count = sum(1 for a in page.attachments if a.category == "pdf")
+        row_count = _count_csv_rows(csv_file)
         logger.debug(
-            "ページ検出: %s (子=%d, 添付=%d [画像=%d, PDF=%d])",
-            title, len(page.children), att_count, img_count, pdf_count,
+            "データベース登録: source=%s, title=%r, parent=%s, rows=%d%s",
+            rel_path,
+            title,
+            parent_node.source_path if parent_node else "ROOT",
+            row_count,
+            " (重複)" if dup_of else "",
         )
 
-    return items
+    # Markdownファイル → ページノード
+    for md_file in md_files:
+        rel_path = normalize_path(str(md_file.relative_to(root_dir)))
+        title = strip_notion_uuid(md_file.name)
 
+        node = Node(
+            source_path=rel_path,
+            title=title,
+            node_type=NodeType.PAGE,
+            file_path=md_file,
+            parent=parent_node,
+        )
 
-def build_tree(root_dir: Path) -> ExportTree:
-    """エクスポートディレクトリからページツリーを構築する。"""
-    logger.info("ツリー構築開始: %s", root_dir)
-    tree = ExportTree(root_children=_build_items(root_dir))
-    logger.info(
-        "ツリー構築完了: %dページ, %dデータベース",
-        tree.page_count,
-        tree.database_count,
-    )
-    return tree
+        if parent_node:
+            parent_node.children.append(node)
+        registry.register(node)
+
+        logger.debug(
+            "ページ登録: source=%s, title=%r, parent=%s",
+            rel_path,
+            title,
+            parent_node.source_path if parent_node else "ROOT",
+        )
+
+        # 対応する子フォルダ (ページ名と同じ stem のフォルダ)
+        child_dir = directory / md_file.stem
+        if child_dir.is_dir():
+            _build_recursive(child_dir, root_dir, node, registry)

@@ -1,4 +1,4 @@
-"""データモデル定義"""
+"""データモデル定義 (後方互換用のエイリアスを含む)"""
 
 from __future__ import annotations
 
@@ -12,70 +12,3 @@ class ColumnDef:
 
     name: str
     inferred_type: str  # "title", "rich_text", "number", "date", "url", "checkbox"
-
-
-@dataclass
-class Attachment:
-    """ページに添付されたファイル"""
-
-    file_path: Path
-    file_name: str
-    mime_type: str  # "image/png", "application/pdf", etc.
-    category: str  # "image", "pdf", "other"
-    referenced_from: str = ""  # Markdown内の参照パス
-    exists: bool = True
-
-
-@dataclass
-class ExportedDatabase:
-    """エクスポートされたデータベース"""
-
-    title: str
-    csv_path: Path
-    columns: list[ColumnDef] = field(default_factory=list)
-    row_count: int = 0
-    notion_id: str | None = None
-
-
-@dataclass
-class ExportedPage:
-    """エクスポートされたページ"""
-
-    title: str
-    markdown_path: Path
-    children: list[ExportedPage | ExportedDatabase] = field(default_factory=list)
-    images: list[Path] = field(default_factory=list)
-    attachments: list[Attachment] = field(default_factory=list)
-    notion_id: str | None = None
-
-
-@dataclass
-class ExportTree:
-    """エクスポート全体のツリー構造"""
-
-    root_children: list[ExportedPage | ExportedDatabase] = field(default_factory=list)
-
-    @property
-    def page_count(self) -> int:
-        """全ページ数を再帰的にカウント"""
-        count = 0
-        stack = list(self.root_children)
-        while stack:
-            item = stack.pop()
-            if isinstance(item, ExportedPage):
-                count += 1
-                stack.extend(item.children)
-        return count
-
-    @property
-    def database_count(self) -> int:
-        """全データベース数を再帰的にカウント"""
-        count = 0
-        stack = list(self.root_children)
-        while stack:
-            item = stack.pop()
-            if isinstance(item, ExportedDatabase):
-                count += 1
-            elif isinstance(item, ExportedPage):
-                stack.extend(item.children)
-        return count
